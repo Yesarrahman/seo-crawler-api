@@ -37,8 +37,7 @@ export async function runSerpCrawler(config: SerpCrawlerConfig): Promise<SERPRes
         // Browser configuration for stealth / debugging
         launchContext: {
             launchOptions: {
-                headless: true, // set to true again for production
-                // slowMo: 200,     // slow actions so you can see what's happening
+                headless: false,  // DEBUG: set to true for production
                 args: [
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
@@ -71,22 +70,32 @@ export async function runSerpCrawler(config: SerpCrawlerConfig): Promise<SERPRes
             const keyword = request.userData.keyword as string;
             log.info(`Crawling SERP for: ${keyword}`);
 
-            // Let the page fully load
+            // Allow page to load
             try {
                 await page.waitForLoadState('networkidle', { timeout: 45000 });
             } catch {
                 log.warning(`Timeout waiting for networkidle for keyword "${keyword}"`);
             }
 
+            // Log URL & title so we know what we actually got
+            const currentUrl = page.url();
+            const title = await page.title();
+            log.info(`Loaded URL: ${currentUrl}`);
+            log.info(`Page title: ${title}`);
+
+            if (currentUrl.includes('/sorry/')) {
+                log.error('Blocked by Google (sorry page).');
+                throw new Error('Blocked by Google (sorry page). Try headless: false or use proxies.');
+            }
+
             // Handle Google consent / cookie screen if present
             await handleGoogleConsent(page);
 
-            // Try to ensure results container exists (but don't fail hard)
-            try {
-                await page.waitForSelector('#search', { timeout: 30000 });
-            } catch {
-                log.warning(`No #search container found for keyword "${keyword}"`);
-            }
+            // Count result headings (any <h3> inside an <a>)
+            const headingsCount = await page.evaluate(
+                () => document.querySelectorAll('a h3').length,
+            );
+            log.info(`Found ${headingsCount} <h3> elements inside <a> tags`);
 
             // Random delay to mimic human behavior
             const delay = Math.random() * (maxDelay - minDelay) + minDelay;
@@ -124,7 +133,11 @@ export async function runSerpCrawler(config: SerpCrawlerConfig): Promise<SERPRes
 async function handleGoogleConsent(page: Page): Promise<void> {
     try {
         const url = page.url();
-        if (!url.includes('consent.google') && !url.includes('consent.') && !url.includes('consent.youtube')) {
+        if (
+            !url.includes('consent.google') &&
+            !url.includes('consent.') &&
+            !url.includes('consent.youtube')
+        ) {
             return;
         }
 
@@ -153,45 +166,48 @@ async function handleGoogleConsent(page: Page): Promise<void> {
 }
 
 /**
- * Extract SERP results from the currently loaded Google search page.
- * This version uses more defensive selectors to match current markup.
+ * Extract SERP results using the pattern "any <h3> inside an <a>".
  */
 async function extractSerpResults(
     page: Page,
     keyword: string,
-    maxResults: number
+    maxResults: number,
 ): Promise<SERPResult[]> {
     return page.evaluate(
         ({ keyword, maxResults }) => {
             const results: SERPResult[] = [];
 
-            // Different containers Google might use for organic results
-            const cards = document.querySelectorAll(
-                '#search .g, ' +
-                '#search div.MjjYud, ' +
-                '#search div[data-sokoban-container]'
+            // Find all headings that are children of links
+            const headingNodes = Array.from(
+                document.querySelectorAll<HTMLHeadingElement>('a h3'),
             );
 
             let position = 1;
 
-            for (const card of Array.from(cards)) {
+            for (const h3 of headingNodes) {
                 if (position > maxResults) break;
 
-                const linkElement = card.querySelector('a[href^="http"]');
-                const titleElement = card.querySelector('h3');
-                const descElement =
-                    card.querySelector('[data-sncf]') ||
-                    card.querySelector('.VwiC3b') ||
-                    card.querySelector('div[style*="-webkit-line-clamp"]');
+                const link = h3.closest('a');
+                if (!link || !link.href) continue;
 
-                if (!linkElement || !titleElement) continue;
+                // Try to find a nearby description snippet
+                let description = '';
+                const container = link.closest('div');
+
+                if (container) {
+                    const descEl =
+                        container.querySelector<HTMLElement>('.VwiC3b') ??
+                        container.querySelector<HTMLElement>('[data-sncf]') ??
+                        container.querySelector<HTMLElement>('div[style*="-webkit-line-clamp"]');
+                    description = descEl?.textContent?.trim() ?? '';
+                }
 
                 results.push({
                     keyword,
                     position,
-                    url: (linkElement as HTMLAnchorElement).href || '',
-                    title: titleElement.textContent?.trim() || '',
-                    description: descElement?.textContent?.trim() || '',
+                    url: link.href,
+                    title: h3.textContent?.trim() || '',
+                    description,
                     crawledAt: new Date().toISOString(),
                 });
 
@@ -200,7 +216,7 @@ async function extractSerpResults(
 
             return results;
         },
-        { keyword, maxResults }
+        { keyword, maxResults },
     );
 }
 
